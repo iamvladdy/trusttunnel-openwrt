@@ -1,0 +1,13 @@
+{
+	"admin/status/trusttunnel": {
+		"title": "TrustTunnel",
+		"order": 75,
+		"action": {
+			"type": "view",
+			"path": "trusttunnel/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-trusttunnel" ]
+		}
+	}
+}

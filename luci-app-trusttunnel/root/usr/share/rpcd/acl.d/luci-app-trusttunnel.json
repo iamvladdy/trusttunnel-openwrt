@@ -1,0 +1,14 @@
+{
+	"luci-app-trusttunnel": {
+		"description": "LuCI TrustTunnel application",
+		"read": {
+			"ubus": {
+				"luci.trusttunnel": [ "getTrustTunnelStatus" ]
+			},
+			"uci": [ "network" ]
+		},
+		"write": {
+			"uci": [ "network" ]
+		}
+	}
+}

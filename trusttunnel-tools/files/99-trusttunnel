@@ -1,0 +1,34 @@
+#!/bin/sh
+# TrustTunnel hotplug — WAN reconnect only (no startup logic)
+# Place at: /etc/hotplug.d/iface/99-trusttunnel
+
+LOG_TAG="trusttunnel"
+
+[ "$ACTION" = "ifup" ] || exit 0
+
+tt_interfaces() {
+	uci show network 2>/dev/null \
+		| awk -F'[.=]' '/\.proto=.trusttunnel/{print $2}'
+}
+
+# Skip our own interface
+for tt_iface in $(tt_interfaces); do
+	if [ "$INTERFACE" = "$tt_iface" ] || \
+	   [ "$DEVICE" = "$tt_iface" ]; then
+		exit 0
+	fi
+done
+
+# Only react to WAN going up
+[ "$INTERFACE" = "wan" ] || exit 0
+
+# Bring up any TrustTunnel interface that is down
+for tt_iface in $(tt_interfaces); do
+	if ! ip link show "$tt_iface" >/dev/null 2>&1; then
+		logger -t "$LOG_TAG" \
+			"WAN up, bringing up $tt_iface"
+		ifup "$tt_iface" &
+	fi
+done
+
+exit 0

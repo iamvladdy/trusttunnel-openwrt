@@ -1,0 +1,124 @@
+// TrustTunnel rpcd backend
+// Reads process state and log to provide status data to LuCI
+'use strict';
+
+import { popen, readfile } from 'fs';
+import { cursor } from 'uci';
+
+function trim_str(s) {
+	return s ? replace(s, /^\s+|\s+$/g, '') : '';
+}
+
+function read_file(path) {
+	return trim_str(readfile(path) ?? '');
+}
+
+function is_running(pid) {
+	if (!pid || pid == '')
+		return false;
+	// Check /proc/<pid>/status — exists only for live processes
+	const status = readfile(`/proc/${pid}/status`);
+	return (status != null);
+}
+
+function parse_log_status(log) {
+	if (!log || log == '')
+		return 'unknown';
+
+	// Search log in reverse — last matching line wins
+	const lines = split(log, '\n');
+	let state = 'unknown';
+
+	for (let i = 0; i < length(lines); i++) {
+		const line = lines[i];
+		if (index(line, 'VPN_SS_CONNECTED') >= 0)
+			state = 'connected';
+		else if (index(line, 'VPN_SS_CONNECTING') >= 0)
+			state = 'connecting';
+		else if (index(line, 'VPN_SS_DISCONNECTED') >= 0)
+			state = 'disconnected';
+		else if (index(line, 'Failed to create listener') >= 0)
+			state = 'error';
+		else if (index(line, 'Number of connection attempts exceeded') >= 0)
+			state = 'error';
+		else if (index(line, 'Unable to setup routes') >= 0)
+			state = 'error';
+	}
+
+	return state;
+}
+
+function parse_endpoint(log) {
+	if (!log) return '';
+	// Line example: Using endpoint: name=tt.example.com, address=1.2.3.4:443, ...
+	const m = match(log, /Using endpoint: name=([^,\n]+)/);
+	return m ? trim_str(m[1]) : '';
+}
+
+function parse_endpoint_ip(log) {
+	if (!log) return '';
+	const m = match(log, /address=([0-9.:a-fA-F\[\]]+)/);
+	return m ? trim_str(m[1]) : '';
+}
+
+function parse_last_error(log) {
+	if (!log) return '';
+	const lines = split(log, '\n');
+	for (let i = length(lines) - 1; i >= 0; i--) {
+		if (index(lines[i], 'ERROR') >= 0)
+			return trim_str(replace(lines[i], /^[^ ]+ [^ ]+ ERROR +\[[0-9]+\] /, ''));
+	}
+	return '';
+}
+
+const methods = {
+	getTrustTunnelStatus: {
+		call: function() {
+			const uci = cursor();
+			uci.load('network');
+
+			const result = {};
+
+			// Find all interfaces using trusttunnel protocol
+			uci.foreach('network', 'interface', function(s) {
+				if (s.proto != 'trusttunnel')
+					return;
+
+				const iface = s['.name'];
+				const run_dir = '/var/run/trusttunnel';
+				const pid_file = `${run_dir}/${iface}.pid`;
+				const log_file = `${run_dir}/${iface}.log`;
+
+				const pid = read_file(pid_file);
+				const running = is_running(pid);
+				const log = read_file(log_file);
+
+				// Get interface IP from system
+				const ip_out = trim_str(popen(`ip -4 addr show dev ${iface} 2>/dev/null`)?.read?.('all') ?? '');
+				const ip_m = match(ip_out, /inet ([0-9.]+\/[0-9]+)/);
+				const tun_ip = ip_m ? ip_m[1] : '';
+
+				const ip6_out = trim_str(popen(`ip -6 addr show dev ${iface} scope global 2>/dev/null`)?.read?.('all') ?? '');
+				const ip6_m = match(ip6_out, /inet6 ([0-9a-f:]+\/[0-9]+)/);
+				const tun_ip6 = ip6_m ? ip6_m[1] : '';
+
+				result[iface] = {
+					name:         iface,
+					pid:          running ? pid : '',
+					running:      running,
+					state:        running ? parse_log_status(log) : 'stopped',
+					tun_ip:       tun_ip,
+					tun_ip6:      tun_ip6,
+					endpoint:     parse_endpoint(log),
+					endpoint_ip:  parse_endpoint_ip(log),
+					last_error:   running ? '' : parse_last_error(log),
+					config_file:  s.config_file ?? '',
+				};
+			});
+
+			return result;
+		}
+	}
+};
+
+return { 'luci.trusttunnel': methods };
