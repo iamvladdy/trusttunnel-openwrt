@@ -75,7 +75,15 @@ sh <(wget -O - https://raw.githubusercontent.com/iamvladdy/trusttunnel-openwrt/r
 Скопировать `config.toml` с сервера на роутер:
 
 ```bash
-scp -O config.toml root@<router>:/opt/trusttunnel_client/trusttunnel_client.toml
+scp -O config.toml root@<router>:/opt/trusttunnel_client
+```
+
+Создать конфиг клиента
+
+```bash
+./opt/trusttunnel_client/setup_wizard --mode non-interactive \
+    --endpoint_config config.toml \
+    --settings trusttunnel_client.toml
 ```
 
 Открыть файл и убедиться что секция `[listener.tun]` выглядит так:
