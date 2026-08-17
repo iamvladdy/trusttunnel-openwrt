@@ -287,6 +287,7 @@ function latencyTiles(lat) {
 
 	function one(label, p, note) {
 		if (!p) return;
+
 		if (!p.ok) {
 			out.push(tile(label,
 				E('span', { 'class': 'tt-dim', 'style': 'font-size:.95rem' },
@@ -294,12 +295,22 @@ function latencyTiles(lat) {
 				p.reason || note));
 			return;
 		}
+
+		/* A TCP handshake measurement reports seconds from curl rather than
+		   ping's min/avg/max triple. */
+		if (p.method == 'tcp') {
+			out.push(tile(label,
+				Math.round(parseFloat(p.connect_s) * 1000) + ' ms',
+				_('TCP handshake to 1.1.1.1 via the tunnel')));
+			return;
+		}
+
 		out.push(tile(label, p.avg + ' ms',
 			_('min %s / max %s · loss %d%%').format(p.min, p.max, p.loss)));
 	}
 
 	one(_('Endpoint RTT'), lat.endpoint, _('direct to server'));
-	one(_('Tunnel RTT'), lat.tunnel, _('ICMP to 1.1.1.1 bound to the tun device'));
+	one(_('Tunnel RTT'), lat.tunnel, _('through the tunnel'));
 
 	return out;
 }
@@ -374,13 +385,12 @@ function renderIface(name, info) {
 	if (certNote)
 		notes.push(certNote);
 
-	/* A failed tunnel ping is expected in the podkop setup: with
-	   included_routes = [] there is no route for arbitrary destinations via
-	   the tun device, so binding to it cannot deliver the packet. Say so
-	   instead of leaving a bare failure on screen. */
+	/* Only warn when both the ICMP and the TCP probe failed. ICMP alone
+	   failing is normal — the tunnel carries TCP but not echo requests — and
+	   is handled by falling back to a handshake measurement. */
 	if (p.latency && p.latency.tunnel && !p.latency.tunnel.ok)
-		notes.push(E('div', { 'class': 'tt-note tt-n-info' }, [
-			_('Tunnel RTT failing is normal with included_routes = [] — routing is podkop\'s job, so there is no route to 1.1.1.1 through the tun device and ICMP bound to it cannot be delivered. It does not mean the tunnel is broken: verify with a destination podkop actually routes, e.g. curl --interface %s https://ifconfig.me').format(name)
+		notes.push(E('div', { 'class': 'tt-note tt-n-warn' }, [
+			_('Could not measure latency through the tunnel. Confirm by hand whether it carries traffic at all: curl --interface %s https://ifconfig.me should print your server IP.').format(name)
 		]));
 
 	if (info.last_error) {

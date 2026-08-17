@@ -567,11 +567,43 @@ const methods = {
 				res.endpoint = parse_ping(sh(`ping -c 2 -W 1 -q ${tgt.host} 2>&1`));
 
 			// Through the tunnel — only meaningful while the device exists.
-			// Note this needs a route via the device, which included_routes = []
-			// deliberately does not create; a failure here is not conclusive.
-			if (readfile(`/sys/class/net/${iface}/mtu`) != null)
-				res.tunnel = parse_ping(
+			//
+			// ICMP is tried first but usually fails: the tunnel forwards TCP
+			// fine (curl --interface works) while echo requests are not
+			// carried. So fall back to timing a TCP handshake, which is a real
+			// round trip through the tunnel and needs no DNS or third party
+			// service beyond a well-known address.
+			if (readfile(`/sys/class/net/${iface}/mtu`) != null) {
+				const icmp = parse_ping(
 					sh(`ping -c 2 -W 1 -q -I ${iface} 1.1.1.1 2>&1`));
+
+				if (icmp && icmp.ok) {
+					icmp.method = 'icmp';
+					res.tunnel = icmp;
+				}
+				else {
+					const t = sh(`curl -s -o /dev/null -w '%{time_connect}' ` +
+						`--interface ${iface} --max-time 8 http://1.1.1.1/ 2>/dev/null`);
+					const m = match(trim_str(t), /^([0-9]+\.[0-9]+)$/);
+
+					if (m && m[1] + 0 > 0)
+						res.tunnel = {
+							ok: true,
+							method: 'tcp',
+							// Seconds as printed by curl; converted to ms in
+							// the browser, like the certificate date.
+							connect_s: m[1],
+						};
+					else
+						res.tunnel = {
+							ok: false,
+							method: 'tcp',
+							reason: icmp && icmp.reason
+								? `ICMP: ${icmp.reason}; TCP connect also failed`
+								: 'neither ICMP nor a TCP connect got through',
+						};
+				}
+			}
 
 			return res;
 		}
