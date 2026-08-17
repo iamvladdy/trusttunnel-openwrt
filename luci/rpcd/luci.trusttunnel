@@ -36,6 +36,28 @@ function has_cmd(name) {
 	return length(sh(`command -v ${name} 2>/dev/null`)) > 0;
 }
 
+// BusyBox has carried two incompatible timeout syntaxes ("timeout SECS CMD"
+// and the older "timeout -t SECS CMD"). Probe once rather than assume, so a
+// mismatch cannot turn into a command that never runs.
+function timeout_prefix(secs) {
+	if (sh(`timeout 1 true >/dev/null 2>&1 && echo ok`) == 'ok')
+		return `timeout ${secs} `;
+	if (sh(`timeout -t 1 true >/dev/null 2>&1 && echo ok`) == 'ok')
+		return `timeout -t ${secs} `;
+	return '';
+}
+
+// Last non-empty line — where command line tools put the actual failure.
+function last_line(text) {
+	const lines = split(text ?? '', '\n');
+	for (let i = length(lines) - 1; i >= 0; i--) {
+		const l = trim_str(lines[i]);
+		if (length(l))
+			return (length(l) > 200) ? substr(l, 0, 200) : l;
+	}
+	return '';
+}
+
 function is_running(pid) {
 	if (!pid || pid == '')
 		return false;
@@ -477,16 +499,44 @@ const methods = {
 
 			const host = tgt.host, port = tgt.port, sni = tgt.sni;
 
-			const out = sh(`echo | timeout 10 openssl s_client ` +
-				`-connect ${host}:${port} -servername ${sni} 2>/dev/null ` +
-				`| openssl x509 -noout -subject -issuer -enddate 2>/dev/null`);
+			// Keep stdout and stderr in separate files instead of piping into a
+			// second openssl: the PEM stays clean, and stderr keeps the reason
+			// the handshake failed rather than it being discarded.
+			const pem_file = `/tmp/tt-cert-${iface}.pem`;
+			const err_file = `/tmp/tt-cert-${iface}.err`;
 
-			if (!out)
-				return { error: `no TLS response from ${host}:${port}` };
+			sh(`echo | ${timeout_prefix(10)}openssl s_client ` +
+				`-connect ${host}:${port} -servername ${sni} ` +
+				`>${pem_file} 2>${err_file}`);
+
+			const pem = readfile(pem_file) ?? '';
+			const errout = readfile(err_file) ?? '';
+
+			if (index(pem, 'BEGIN CERTIFICATE') < 0) {
+				sh(`rm -f ${pem_file} ${err_file}`);
+				const why = last_line(errout);
+				return { error: why
+					? `no certificate from ${host}:${port} — ${why}`
+					: `no TLS response from ${host}:${port}` };
+			}
+
+			// s_client writes a chain listing and session details around the
+			// PEM, so cut out just the first certificate block instead of
+			// relying on the parser to skip the preamble.
+			const crt_file = `${pem_file}.crt`;
+			sh(`sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' ${pem_file} ` +
+				`| sed '/END CERTIFICATE/q' > ${crt_file}`);
+
+			const out = sh(`openssl x509 -in ${crt_file} ` +
+				`-noout -subject -issuer -enddate 2>&1`);
+			sh(`rm -f ${pem_file} ${err_file} ${crt_file}`);
 
 			const not_after = match(out, /notAfter=(.+)/);
 			const subject   = match(out, /subject=(.+)/);
 			const issuer    = match(out, /issuer=(.+)/);
+
+			if (!not_after)
+				return { error: `could not read the certificate — ${last_line(out)}` };
 
 			return {
 				host:      `${host}:${port}`,
