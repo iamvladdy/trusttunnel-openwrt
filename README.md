@@ -16,7 +16,10 @@ netifd → proto_trusttunnel_setup() → trusttunnel_client → tun0
 
 - OpenWRT 24.10 (opkg) или 25.x (apk) — определяется автоматически
 - Минимум 20 MB свободного места
-- VPS с Linux (x86\_64 или aarch64) для сервера TrustTunnel
+- Доступ к серверу TrustTunnel. Либо свой VPS с Linux (x86\_64 или aarch64) —
+  см. [Часть 1](#часть-1-настройка-сервера-на-vps), либо готовые данные
+  подключения к чужому серверу — см.
+  [Часть 1-Б](#часть-1-б-если-сервер-не-свой)
 
 ## Часть 1. Настройка сервера на VPS
 
@@ -63,6 +66,131 @@ cd /opt/trusttunnel/
 > Self-signed сертификат экспортируется в конфиг автоматически — с ним IP в
 > `-a` допустим.
 
+## Часть 1-Б. Если сервер не свой
+
+Часть 1 нужна только если вы поднимаете сервер сами. Если сервер чужой и вам
+выдали готовые данные подключения — пропустите её целиком и начните с
+[Части 2.1](#21-установить) (установка на роутер), а конфиг клиента создайте
+одним из трёх способов ниже.
+
+### Что нужно получить у владельца сервера
+
+| Параметр | Пример | Обязателен |
+| -------- | ------ | ---------- |
+| Хост для TLS (`hostname`) | `vpn.example.com` | да |
+| Адрес и порт (`addresses`) | `203.0.113.10:443` | да |
+| Логин (`username`) | `router` | да |
+| Пароль (`password`) | `s3cret` | да |
+| Сертификат сервера (PEM) | `server.pem` | только если self-signed |
+
+`hostname` и `addresses` — **разные вещи**, и именно здесь чаще всего
+ошибаются. `addresses` — куда подключаться (IP или домен с портом),
+`hostname` — имя, по которому проверяется TLS-сертификат. Если сертификат
+выпущен на `vpn.example.com`, то `hostname` обязан быть `vpn.example.com`,
+даже если в `addresses` стоит голый IP.
+
+### Вариант А. Есть файл конфига от сервера
+
+Владелец сервера может отдать готовый экспорт (`config.toml`, он же
+`--format toml` из шага 1.4) или deeplink. Тогда конфиг клиента собирается
+мастером:
+
+```bash
+scp -O config.toml root@<router>:/opt/trusttunnel_client/
+
+cd /opt/trusttunnel_client
+./setup_wizard --mode non-interactive \
+    --endpoint_config config.toml \
+    --settings trusttunnel_client.toml
+```
+
+### Вариант Б. Есть только логин, пароль и адрес
+
+Мастер умеет собирать конфиг прямо из параметров — VPS для этого не нужен:
+
+```bash
+cd /opt/trusttunnel_client
+./setup_wizard --mode non-interactive \
+    --address 203.0.113.10:443 \
+    --hostname vpn.example.com \
+    --creds router:s3cret \
+    --settings trusttunnel_client.toml
+```
+
+- `--address` можно указать несколько раз — клиент сам выберет лучший адрес
+- если сертификат self-signed, добавьте `--cert /opt/trusttunnel_client/server.pem`
+
+После этого всё равно откройте файл и поправьте `[listener.tun]` под роутер —
+мастер ставит дефолты для десктопа (см. [2.2](#22-настроить-конфиг-клиента)).
+
+### Вариант В. Написать конфиг руками
+
+Минимальный рабочий `trusttunnel_client.toml` для связки OpenWRT + podkop.
+Положить в `/opt/trusttunnel_client/trusttunnel_client.toml`:
+
+```toml
+loglevel = "info"
+vpn_mode = "general"
+killswitch_enabled = false
+exclusions = []
+
+[endpoint]
+hostname = "vpn.example.com"
+addresses = ["203.0.113.10:443"]
+username = "router"
+password = "s3cret"
+certificate = ""
+skip_verification = false
+upstream_protocol = "http2"
+anti_dpi = false
+
+[listener]
+
+[listener.tun]
+device_name = "tun0"
+included_routes = []
+excluded_routes = []
+change_system_dns = false
+mtu_size = 1280
+```
+
+Что здесь важно именно для роутера — остальное можно не трогать:
+
+| Поле | Значение | Почему |
+| ---- | -------- | ------ |
+| `included_routes` | `[]` | Маршрутами управляет podkop. С `["0.0.0.0/0"]` весь трафик уйдёт в тоннель и обычный интернет отвалится |
+| `change_system_dns` | `false` | Иначе клиент перепишет DNS роутера и сломает dnsmasq |
+| `killswitch_enabled` | `false` | Дефолт `true` режет трафик при падении VPN. На роутере тоннель нужен только для выбранных доменов, поэтому killswitch отключаем — иначе падение тоннеля утащит за собой всю LAN |
+| `mtu_size` | `1280` | Дефолт `1350` не переживает PPPoE/двойную инкапсуляцию |
+| `device_name` | `"tun0"` | Имя TUN-интерфейса. Пустое значение — имя даёт ядро, и proto handler'у приходится переименовывать устройство. С явным `tun0` совпадает с именем UCI-интерфейса |
+| `certificate` | `""` | Пусто — проверка по системному хранилищу (нужен `ca-bundle`). Для self-signed вписать PEM, см. ниже |
+| `bound_if` | не указывать | Вызывает падение бинарника при фоновом запуске |
+
+Self-signed сертификат вписывается многострочной строкой TOML:
+
+```toml
+[endpoint]
+hostname = "vpn.example.com"
+certificate = """
+-----BEGIN CERTIFICATE-----
+MIIBkTCB+wIJAKk...
+-----END CERTIFICATE-----
+"""
+```
+
+Полный список полей со всеми дефолтами —
+[в документации клиента](https://github.com/TrustTunnel/TrustTunnelClient/blob/master/trusttunnel/README.md#configuration-reference).
+
+Проверить конфиг до создания UCI-интерфейса можно запуском в foreground:
+
+```bash
+/opt/trusttunnel_client/trusttunnel_client \
+  -c /opt/trusttunnel_client/trusttunnel_client.toml
+# ожидаем "Successfully connected to endpoint", затем Ctrl+C
+```
+
+Дальше — [2.3. Создать UCI интерфейс](#23-создать-uci-интерфейс).
+
 ## Часть 2. Установка на роутере
 
 ### 2.1. Установить
@@ -78,6 +206,9 @@ sh <(wget -O - https://raw.githubusercontent.com/iamvladdy/trusttunnel-openwrt/r
 - Загрузит официальный бинарник TrustTunnel клиента для архитектуры роутера
 
 ### 2.2. Настроить конфиг клиента
+
+> Если сервер не свой и у вас только данные подключения — этот шаг описан в
+> [Части 1-Б](#часть-1-б-если-сервер-не-свой).
 
 Скопировать `config.toml` с сервера на роутер:
 
@@ -99,7 +230,7 @@ scp -O config.toml root@<router>:/opt/trusttunnel_client
 [listener]
 
 [listener.tun]
-bound_if = ""
+device_name = "tun0"
 included_routes = []
 excluded_routes = []
 change_system_dns = false
@@ -107,6 +238,16 @@ mtu_size = 1280
 ```
 
 > **Важно:** `included_routes = []` — клиент не прописывает маршруты сам, маршрутизацией управляет podkop. Если поставить `["0.0.0.0/0"]`, весь трафик пойдёт через TrustTunnel и обычный интернет перестанет работать.
+
+А в корне конфига — выключить killswitch, иначе падение тоннеля отрежет
+трафик всей LAN:
+
+```toml
+killswitch_enabled = false
+```
+
+Назначение остальных полей — в
+[таблице из Части 1-Б](#вариант-в-написать-конфиг-руками).
 
 ### 2.3. Создать UCI интерфейс
 
@@ -356,7 +497,8 @@ nc -z <IP_VPS> 443 && echo reachable
 
 ## Известные ограничения
 
-- **Имя интерфейса** — должно быть `tun0`. Параметр `bound_if` в конфиге клиента вызывает crash бинарника при фоновом запуске (баг в TrustTunnelClient).
+- **Имя интерфейса** — имя UCI-интерфейса должно совпадать с `device_name` из `[listener.tun]`. Если `device_name` пустой, ядро выдаёт имя само (`tun0`), и proto handler переименовывает устройство — работает, но надёжнее задать `device_name` явно. Протестировано только с `tun0`.
+- **`bound_if`** — задавать нельзя: вызывает crash бинарника при фоновом запуске (баг в TrustTunnelClient).
 - **Hotplug** — если WAN называется не `wan` (например `pppoe-wan`), нужно поправить `/etc/hotplug.d/iface/99-trusttunnel`, заменив `[ "$INTERFACE" = "wan" ]` на своё имя. Узнать имя WAN: `uci show network | grep proto`.
 - **Протестировано** — OpenWRT 25.12.2, Flint 2 (MT7986A, aarch64).
 
