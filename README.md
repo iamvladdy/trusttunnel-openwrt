@@ -56,6 +56,13 @@ cd /opt/trusttunnel/
   --format toml > config.toml
 ```
 
+> **Если сертификат от Let's Encrypt** — передавайте в `-a` **домен**, а не IP:
+> сертификат такого типа в конфиг не вписывается (клиент проверяет его по
+> системному хранилищу), и `hostname` обязан совпадать с именем в сертификате.
+> С IP вместо домена проверка упадёт с ошибкой `OPENSSL_internal`.
+> Self-signed сертификат экспортируется в конфиг автоматически — с ним IP в
+> `-a` допустим.
+
 ## Часть 2. Установка на роутере
 
 ### 2.1. Установить
@@ -66,7 +73,7 @@ sh <(wget -O - https://raw.githubusercontent.com/iamvladdy/trusttunnel-openwrt/r
 
 Скрипт автоматически:
 - Определит менеджер пакетов (apk / opkg)
-- Установит зависимости: `kmod-tun`, `ip-full`, `curl`
+- Установит зависимости: `kmod-tun`, `ip-full`, `curl`, `ca-bundle`
 - Скачает и установит netifd proto handler, hotplug-хук и LuCI плагин
 - Загрузит официальный бинарник TrustTunnel клиента для архитектуры роутера
 
@@ -243,6 +250,97 @@ ip route flush table 880 2>/dev/null
 
 service rpcd restart
 service network restart
+```
+
+## Диагностика
+
+### `Error: 7 ... invalid library (0):OPENSSL_internal:unknown library`
+
+```
+TRUSTTUNNEL_CLIENT_APP operator(): Error: 7
+error:00000001:invalid library (0):OPENSSL_internal:unknown library
+```
+
+Несмотря на формулировку, это **не** проблема с библиотекой. Клиент собран
+статически с BoringSSL, и такое сообщение с пустой очередью ошибок означает,
+что **не удалось проверить сертификат сервера**. Три причины, по частоте:
+
+**1. На роутере нет системного хранилища корневых сертификатов.**
+Если в конфиге `certificate = ""`, клиент использует системное хранилище —
+BoringSSL ищет `/etc/ssl/cert.pem`. В ванильном OpenWRT этого файла нет.
+
+```bash
+ls -l /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
+apk add ca-bundle      # или: opkg install ca-bundle
+ifdown tun0 && ifup tun0
+```
+
+**2. `hostname` не совпадает с сертификатом сервера.**
+Проверка идёт по `hostname` из секции `[endpoint]`, а не по адресу из
+`addresses`. Если сертификат выпущен Let's Encrypt на домен, а в `hostname`
+попал IP VPS (например, при экспорте конфига через `-a <IP>` без `-n`),
+проверка не пройдёт.
+
+```bash
+grep -A3 '^\[endpoint\]' /opt/trusttunnel_client/trusttunnel_client.toml
+# hostname должен быть доменом из сертификата, IP остаётся в addresses:
+#   hostname  = "vpn.example.com"
+#   addresses = ["203.0.113.10:443"]
+```
+
+Проверить, какое имя реально в сертификате сервера:
+
+```bash
+openssl s_client -connect <IP_VPS>:443 -servername vpn.example.com \
+  </dev/null 2>/dev/null | openssl x509 -noout -subject -dates -ext subjectAltName
+```
+
+**3. Сертификат self-signed и не закреплён в конфиге.**
+Self-signed сертификат нельзя проверить через системное хранилище — его PEM
+нужно вписать в конфиг клиента. Забрать с VPS и вставить в `[endpoint]`:
+
+```toml
+[endpoint]
+hostname = "vpn.example.com"
+certificate = """
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
+```
+
+> `skip_verification = true` тоже уберёт ошибку, но отключит проверку
+> сертификата целиком — трафик станет уязвим к MITM. Только для отладки.
+
+**Ещё одна причина — неверные часы роутера.** Сертификат проверяется по
+системному времени, и до синхронизации NTP любой сертификат выглядит как
+«ещё не действительный»:
+
+```bash
+date                      # сверить с реальным временем
+service sysntpd restart
+```
+
+Proto handler теперь сам ждёт синхронизации времени и подставляет
+`SSL_CERT_FILE`, а при отсутствии хранилища пишет в syslog конкретную
+причину вместо ожидания таймаута:
+
+```bash
+logread | grep trusttunnel | tail -20
+```
+
+### Общая диагностика
+
+```bash
+# Полный лог клиента — там настоящая причина падения
+tail -n 50 /var/run/trusttunnel/tun0.log
+
+# Проверить, что порт VPS доступен с роутера
+nc -z <IP_VPS> 443 && echo reachable
+
+# Проверить конфиг клиента вручную, в foreground
+/opt/trusttunnel_client/trusttunnel_client \
+  -c /opt/trusttunnel_client/trusttunnel_client.toml
 ```
 
 ## Известные ограничения

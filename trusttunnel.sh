@@ -37,6 +37,100 @@ tt_cleanup_routes() {
 	ip -6 route flush table $TT_TABLE 2>/dev/null || true
 }
 
+tt_log_tail() {
+	local log_file="$1"
+	[ -f "$log_file" ] || return 0
+	tail -n 20 "$log_file" 2>/dev/null | while IFS= read -r line; do
+		[ -n "$line" ] && logger -t "trusttunnel" "client: $line"
+	done
+}
+
+# Locate the system CA bundle and point BoringSSL at it.
+#
+# The official client binary is statically linked against BoringSSL, which
+# resolves the trust store from SSL_CERT_FILE / SSL_CERT_DIR, falling back to
+# the compiled-in OPENSSLDIR (/etc/ssl/cert.pem). Vanilla OpenWRT ships no
+# trust store at all; the ca-bundle package is what creates
+# /etc/ssl/certs/ca-certificates.crt plus the /etc/ssl/cert.pem symlink.
+tt_setup_trust_store() {
+	local config_file="$1"
+
+	# A pinned PEM or disabled verification means the store is not consulted.
+	if grep -qE '^[[:space:]]*skip_verification[[:space:]]*=[[:space:]]*true' \
+			"$config_file" 2>/dev/null; then
+		return 0
+	fi
+
+	local cert_val
+	cert_val=$(sed -n \
+		's/^[[:space:]]*certificate[[:space:]]*=[[:space:]]*//p' \
+		"$config_file" 2>/dev/null | head -n1)
+	case "$cert_val" in
+		''|'""'|"''"|'null') ;;   # empty → system store is used
+		*) return 0 ;;            # pinned certificate present
+	esac
+
+	local ca_file=""
+	local f
+	for f in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+		if [ -s "$f" ]; then
+			ca_file="$f"
+			break
+		fi
+	done
+
+	if [ -z "$ca_file" ]; then
+		logger -t "trusttunnel" \
+			"error: no CA bundle found (/etc/ssl/cert.pem)."
+		logger -t "trusttunnel" \
+			"error: install it with 'apk add ca-bundle' (or 'opkg install ca-bundle'),"
+		logger -t "trusttunnel" \
+			"error: or pin the endpoint certificate in $config_file"
+		return 1
+	fi
+
+	export SSL_CERT_FILE="$ca_file"
+	[ -d /etc/ssl/certs ] && export SSL_CERT_DIR=/etc/ssl/certs
+	return 0
+}
+
+# Certificate validity is checked against the system clock, so a router that
+# has not yet synced NTP rejects every certificate as "not yet valid".
+tt_wait_for_time() {
+	local floor
+	floor=$(date -r /lib/netifd/proto/trusttunnel.sh +%s 2>/dev/null)
+	# Fall back to a static floor if the mtime is unavailable
+	[ -n "$floor" ] || floor=1750000000
+
+	local waited=0
+	while [ "$(date +%s)" -lt "$floor" ] && [ "$waited" -lt 30 ]; do
+		[ "$waited" -eq 0 ] && logger -t "trusttunnel" \
+			"waiting for NTP time sync (clock is behind install time)"
+		sleep 2
+		waited=$((waited + 2))
+	done
+
+	if [ "$(date +%s)" -lt "$floor" ]; then
+		logger -t "trusttunnel" \
+			"warning: clock still unsynced — certificate validation may fail"
+	fi
+}
+
+# The client needs working upstream routing before its first connect attempt.
+# Without this it fails with "Number of connection attempts exceeded".
+tt_wait_for_wan() {
+	local waited=0
+	while [ "$waited" -lt 30 ]; do
+		if [ -n "$(ip route show default 2>/dev/null)" ]; then
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	logger -t "trusttunnel" "warning: no default route after 30s"
+	return 1
+}
+
 proto_trusttunnel_setup() {
 	local config="$1"  # UCI interface name, e.g. "tun0"
 
@@ -76,10 +170,19 @@ proto_trusttunnel_setup() {
 	ip link del dev "$config" 2>/dev/null || true
 	tt_cleanup_routes
 
-	# Wait for WAN to fully settle before starting the client.
-	# Without this delay the client starts before routing is ready
-	# and fails to connect (Number of connection attempts exceeded).
-	sleep 5
+	# Make sure TLS can actually succeed before spending 30s waiting on a
+	# tunnel that will never come up.
+	if ! tt_setup_trust_store "$config_file"; then
+		proto_setup_failed "$config"
+		exit 1
+	fi
+
+	# Wait for WAN to fully settle before starting the client, then let
+	# routing quiesce. Without this the client starts before routing is
+	# ready and fails to connect (Number of connection attempts exceeded).
+	tt_wait_for_wan
+	tt_wait_for_time
+	sleep 3
 
 	# Start the client — it creates tun0 and sets up routing itself
 	logger -t "trusttunnel" "starting client for interface $config"
@@ -100,6 +203,15 @@ proto_trusttunnel_setup() {
 			found="tun0"
 			break
 		fi
+		# Bail out as soon as the client dies instead of waiting the full
+		# 30s — its own log holds the real reason (TLS, auth, config).
+		if ! kill -0 "$client_pid" 2>/dev/null; then
+			logger -t "trusttunnel" "error: client exited during startup"
+			tt_log_tail "$TT_RUN_DIR/${config}.log"
+			rm -f "$TT_RUN_DIR/${config}.pid"
+			proto_setup_failed "$config"
+			exit 1
+		fi
 		sleep 1
 		elapsed=$((elapsed + 1))
 	done
@@ -107,6 +219,7 @@ proto_trusttunnel_setup() {
 	if [ -z "$found" ]; then
 		logger -t "trusttunnel" \
 			"error: TUN interface did not appear within 30s"
+		tt_log_tail "$TT_RUN_DIR/${config}.log"
 		kill "$client_pid" 2>/dev/null
 		rm -f "$TT_RUN_DIR/${config}.pid"
 		proto_setup_failed "$config"

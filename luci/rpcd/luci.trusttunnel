@@ -43,6 +43,16 @@ function parse_log_status(log) {
 			state = 'error';
 		else if (index(line, 'Unable to setup routes') >= 0)
 			state = 'error';
+		else if (index(line, 'OPENSSL_internal') >= 0)
+			state = 'error';
+		else if (index(line, 'invalid library') >= 0)
+			state = 'error';
+		else if (index(line, 'certificate verify failed') >= 0)
+			state = 'error';
+		else if (index(line, 'Handshake failed') >= 0)
+			state = 'error';
+		else if (index(line, 'Authorization failed') >= 0)
+			state = 'error';
 	}
 
 	return state;
@@ -92,6 +102,7 @@ const methods = {
 				const pid = read_file(pid_file);
 				const running = is_running(pid);
 				const log = read_file(log_file);
+				const state = running ? parse_log_status(log) : 'stopped';
 
 				// Get interface IP from system
 				const ip_out = trim_str(popen(`ip -4 addr show dev ${iface} 2>/dev/null`)?.read?.('all') ?? '');
@@ -106,12 +117,12 @@ const methods = {
 					name:         iface,
 					pid:          running ? pid : '',
 					running:      running,
-					state:        running ? parse_log_status(log) : 'stopped',
+					state:        state,
 					tun_ip:       tun_ip,
 					tun_ip6:      tun_ip6,
 					endpoint:     parse_endpoint(log),
 					endpoint_ip:  parse_endpoint_ip(log),
-					last_error:   running ? '' : parse_last_error(log),
+					last_error:   (state == 'connected') ? '' : parse_last_error(log),
 					config_file:  s.config_file ?? '',
 				};
 			});

@@ -39,7 +39,13 @@ echo ""
 
 echo "Installing dependencies..."
 $PKG_UPDATE
-$PKG_INSTALL kmod-tun ip-full curl
+$PKG_INSTALL kmod-tun ip-full curl ca-bundle
+
+if [ ! -s /etc/ssl/cert.pem ] && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+    echo "WARNING: no CA bundle found at /etc/ssl/cert.pem."
+    echo "         TLS to the endpoint will fail unless you pin the server"
+    echo "         certificate in the client config ([endpoint] certificate)."
+fi
 echo ""
 
 # ---- Install files from repo ----

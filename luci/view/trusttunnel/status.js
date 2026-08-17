@@ -24,6 +24,22 @@ function stateLabel(state) {
 	return E('span', { 'class': 'label ' + l[0] }, [ l[1] ]);
 }
 
+function errorHint(err) {
+	if (!err)
+		return null;
+
+	if (/OPENSSL_internal|invalid library|certificate verify failed|Handshake failed/.test(err))
+		return _('TLS to the endpoint failed. Check that the ca-bundle package is installed, that [endpoint] hostname matches the server certificate, and that the router clock is correct. For a self-signed server certificate, pin it via [endpoint] certificate in the client config.');
+
+	if (/Authorization failed|401|Unauthorized/.test(err))
+		return _('The endpoint rejected the credentials. Check username and password in the client config.');
+
+	if (/Number of connection attempts exceeded/.test(err))
+		return _('The endpoint could not be reached. Check the address, port and that the VPS firewall allows the port.');
+
+	return null;
+}
+
 function renderIface(name, info) {
 	var rows = [
 		[ _('Status'),      stateLabel(info.state)                                          ],
@@ -39,6 +55,10 @@ function renderIface(name, info) {
 
 	if (info.last_error) {
 		rows.push([ _('Last Error'), E('span', { 'style': 'color:red' }, [ info.last_error ]) ]);
+
+		var hint = errorHint(info.last_error);
+		if (hint)
+			rows.push([ _('Hint'), E('span', { 'style': 'color:#856404' }, [ hint ]) ]);
 	}
 
 	return E('div', { 'class': 'cbi-section' }, [
