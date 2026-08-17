@@ -3,11 +3,19 @@
 		"description": "LuCI TrustTunnel application",
 		"read": {
 			"ubus": {
-				"luci.trusttunnel": [ "getTrustTunnelStatus" ]
+				"luci.trusttunnel": [
+					"getTrustTunnelStatus",
+					"getCertInfo",
+					"getLatency",
+					"getClientLog"
+				]
 			},
 			"uci": [ "network" ]
 		},
 		"write": {
+			"ubus": {
+				"luci.trusttunnel": [ "setInterfaceState" ]
+			},
 			"uci": [ "network" ]
 		}
 	}

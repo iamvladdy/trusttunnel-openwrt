@@ -242,7 +242,7 @@ sh <(wget -O - https://raw.githubusercontent.com/iamvladdy/trusttunnel-openwrt/r
 
 Скрипт автоматически:
 - Определит менеджер пакетов (apk / opkg)
-- Установит зависимости: `kmod-tun`, `ip-full`, `curl`, `ca-bundle`
+- Установит зависимости: `kmod-tun`, `ip-full`, `curl`, `ca-bundle`, `openssl-util`
 - Скачает и установит netifd proto handler, hotplug-хук и LuCI плагин
 - Загрузит официальный бинарник TrustTunnel клиента для архитектуры роутера
 
@@ -342,7 +342,24 @@ curl --interface tun0 -s https://ifconfig.me
 После установки:
 
 - **Network → Interfaces → Add → Protocol: TrustTunnel VPN** — создать интерфейс с выбором конфига и MTU
-- **Status → TrustTunnel** — страница статуса с автообновлением каждые 5 секунд: состояние соединения, IP тоннеля, endpoint, PID, последняя ошибка
+- **Status → TrustTunnel** — страница статуса с автообновлением каждые 5 секунд
+
+Что показывает страница статуса:
+
+| Блок | Содержимое |
+| ---- | ---------- |
+| Статус | Состояние соединения, имя интерфейса, endpoint |
+| Счётчики | Принято / отправлено (всего и текущая скорость), uptime процесса, PID, MTU, ошибки интерфейса |
+| Детали | IPv4/IPv6 тоннеля, `hostname` для TLS, адреса endpoint из конфига, режим (`vpn_mode`, `upstream_protocol`, killswitch), путь к конфигу |
+| Предупреждения | `skip_verification = true` и включённый killswitch подсвечиваются — оба легко забыть после отладки |
+| Ошибки | Последняя строка `ERROR` из лога клиента + расшифровка частых причин |
+
+Кнопки:
+
+- **Check certificate** — открывает TLS-соединение к endpoint и показывает, сколько дней осталось сертификату. Красным, если истёк или осталось меньше 14 дней. Использует `openssl-util` — установщик ставит его сам, но пакет опциональный: без него не работает только эта кнопка
+- **Measure latency** — RTT до endpoint напрямую и RTT через тоннель (`ping -I tun0`)
+- **Show log** — последние 50 строк `/var/run/trusttunnel/<iface>.log` без SSH
+- **Restart / Stop / Start** — `ifup` / `ifdown` для интерфейса
 
 ## Управление
 

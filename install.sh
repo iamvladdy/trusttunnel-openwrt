@@ -46,6 +46,13 @@ if [ ! -s /etc/ssl/cert.pem ] && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; th
     echo "         TLS to the endpoint will fail unless you pin the server"
     echo "         certificate in the client config ([endpoint] certificate)."
 fi
+
+# openssl-util powers the "Check certificate" button on the status page. It is
+# optional, so a missing package must not abort the whole install.
+if ! $PKG_INSTALL openssl-util; then
+    echo "NOTE: openssl-util could not be installed."
+    echo "      Everything works except the certificate expiry check in LuCI."
+fi
 echo ""
 
 # ---- Stop running interfaces before replacing scripts and binary ----

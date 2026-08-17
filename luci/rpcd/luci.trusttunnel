@@ -1,9 +1,12 @@
 // TrustTunnel rpcd backend
-// Reads process state and log to provide status data to LuCI
+// Reads process state, interface counters and log to provide status data to LuCI
 'use strict';
 
 import { popen, readfile } from 'fs';
 import { cursor } from 'uci';
+
+const RUN_DIR = '/var/run/trusttunnel';
+const CLIENT_BIN = '/opt/trusttunnel_client/trusttunnel_client';
 
 function trim_str(s) {
 	return s ? replace(s, /^\s+|\s+$/g, '') : '';
@@ -11,6 +14,26 @@ function trim_str(s) {
 
 function read_file(path) {
 	return trim_str(readfile(path) ?? '');
+}
+
+function read_num(path) {
+	const v = readfile(path);
+	return v ? int(trim_str(v)) : 0;
+}
+
+// Run a command and return its trimmed stdout. Closes the handle, unlike a
+// bare popen() chain, so repeated polling does not leak descriptors.
+function sh(cmd) {
+	const h = popen(cmd);
+	if (!h)
+		return '';
+	const out = h.read('all') ?? '';
+	h.close();
+	return trim_str(out);
+}
+
+function has_cmd(name) {
+	return length(sh(`command -v ${name} 2>/dev/null`)) > 0;
 }
 
 function is_running(pid) {
@@ -21,11 +44,93 @@ function is_running(pid) {
 	return (status != null);
 }
 
+// Seconds the client process has been alive, derived from its starttime in
+// /proc/<pid>/stat (field 22, in clock ticks) against /proc/uptime.
+function proc_uptime(pid) {
+	const stat = readfile(`/proc/${pid}/stat`);
+	if (!stat)
+		return 0;
+
+	// The comm field may contain spaces, so start parsing after the last ')'
+	const close = rindex(stat, ')');
+	if (close < 0)
+		return 0;
+
+	const fields = split(trim_str(substr(stat, close + 1)), ' ');
+	// After ')' the first field is state (field 3), so starttime is index 19
+	const starttime = int(fields[19] ?? 0);
+	if (!starttime)
+		return 0;
+
+	const up = split(read_file('/proc/uptime'), ' ');
+	const total = int(up[0] ?? 0);
+	const secs = total - (starttime / 100);   // USER_HZ is 100 on Linux
+	return (secs > 0) ? int(secs) : 0;
+}
+
+// Read a `key = value` line from the TOML config.
+//
+// Done with plain string ops rather than a regex: ucode has no multiline flag
+// and no dynamic regex construction, so a per-line prefix match is both
+// simpler and safer. A commented line never matches, because the '#' stays in
+// front of the key.
+function conf_value(text, key) {
+	if (!text)
+		return '';
+
+	const lines = split(text, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const line = trim_str(lines[i]);
+		if (substr(line, 0, length(key)) != key)
+			continue;
+		// Guard against a longer key with the same prefix (mtu_size vs mtu)
+		const rest = trim_str(substr(line, length(key)));
+		if (substr(rest, 0, 1) != '=')
+			continue;
+		return trim_str(substr(rest, 1));
+	}
+	return '';
+}
+
+function unquote(s) {
+	return trim_str(replace(s ?? '', /^["']|["']$/g, ''));
+}
+
+function parse_config(path) {
+	const text = readfile(path) ?? '';
+
+	const addrs = [];
+	const raw = conf_value(text, 'addresses');
+	if (raw) {
+		const items = match(raw, /"([^"]+)"/g);
+		for (let i = 0; i < length(items ?? []); i++)
+			push(addrs, items[i][1]);
+	}
+
+	// A pinned certificate is usually a TOML multi-line string, so the value on
+	// the key line is just `"""` — test for "not empty" the same way the proto
+	// handler does rather than trying to unquote it.
+	const cert_raw = conf_value(text, 'certificate');
+	const has_cert = !(cert_raw == '' || cert_raw == '""' ||
+	                   cert_raw == "''" || cert_raw == 'null');
+
+	return {
+		hostname:      unquote(conf_value(text, 'hostname')),
+		addresses:     addrs,
+		mtu_size:      unquote(conf_value(text, 'mtu_size')),
+		skip_verify:   unquote(conf_value(text, 'skip_verification')) == 'true',
+		has_cert:      has_cert,
+		killswitch:    unquote(conf_value(text, 'killswitch_enabled')) == 'true',
+		vpn_mode:      unquote(conf_value(text, 'vpn_mode')),
+		upstream:      unquote(conf_value(text, 'upstream_protocol')),
+	};
+}
+
 function parse_log_status(log) {
 	if (!log || log == '')
 		return 'unknown';
 
-	// Search log in reverse — last matching line wins
+	// Search log in order — last matching line wins
 	const lines = split(log, '\n');
 	let state = 'unknown';
 
@@ -43,6 +148,9 @@ function parse_log_status(log) {
 			state = 'error';
 		else if (index(line, 'Unable to setup routes') >= 0)
 			state = 'error';
+		// TLS / certificate verification failures. BoringSSL reports a
+		// missing or unusable trust store with an empty error queue, which
+		// prints as "invalid library (0):OPENSSL_internal:unknown library".
 		else if (index(line, 'OPENSSL_internal') >= 0)
 			state = 'error';
 		else if (index(line, 'invalid library') >= 0)
@@ -83,53 +191,264 @@ function parse_last_error(log) {
 	return '';
 }
 
+// Interface names configured with proto=trusttunnel. Used both to build the
+// status list and to validate names before they reach a shell command.
+function tt_interfaces() {
+	const uci = cursor();
+	uci.load('network');
+
+	const list = [];
+	uci.foreach('network', 'interface', function(s) {
+		if (s.proto == 'trusttunnel')
+			push(list, s['.name']);
+	});
+	return list;
+}
+
+function tt_config_file(iface) {
+	const uci = cursor();
+	uci.load('network');
+	return uci.get('network', iface, 'config_file')
+		?? '/opt/trusttunnel_client/trusttunnel_client.toml';
+}
+
+function is_valid_iface(iface) {
+	const list = tt_interfaces();
+	for (let i = 0; i < length(list); i++)
+		if (list[i] == iface)
+			return true;
+	return false;
+}
+
+// Only hostnames/IPs and ports may be interpolated into a shell command.
+function safe_host(s) {
+	return match(s ?? '', /^[A-Za-z0-9._:\[\]-]+$/) ? s : '';
+}
+
+function split_host_port(addr, fallback_host) {
+	let host = fallback_host;
+	let port = '443';
+
+	if (addr) {
+		// [v6]:port | host:port | host
+		const m6 = match(addr, /^\[([0-9a-fA-F:]+)\]:?([0-9]*)$/);
+		if (m6) {
+			host = m6[1];
+			if (m6[2]) port = m6[2];
+		}
+		else {
+			const m = match(addr, /^([A-Za-z0-9._-]+):([0-9]+)$/);
+			if (m) {
+				host = m[1];
+				port = m[2];
+			}
+			else if (match(addr, /^[A-Za-z0-9._-]+$/))
+				host = addr;
+		}
+	}
+
+	return { host: host, port: port };
+}
+
+function parse_ping(out) {
+	if (!out)
+		return null;
+
+	// BusyBox: "round-trip min/avg/max = 6.5/8.5/10.5 ms"
+	// iputils:  "rtt min/avg/max/mdev = 6.5/8.5/10.5/1.2 ms"
+	const r = match(out, /= *([0-9.]+)\/([0-9.]+)\/([0-9.]+)/);
+	const loss = match(out, /([0-9]+)% packet loss/);
+
+	return {
+		min:  r ? r[1] : '',
+		avg:  r ? r[2] : '',
+		max:  r ? r[3] : '',
+		loss: loss ? int(loss[1]) : 100,
+		ok:   (r != null),
+	};
+}
+
 const methods = {
 	getTrustTunnelStatus: {
 		call: function() {
-			const uci = cursor();
-			uci.load('network');
-
 			const result = {};
+			const ifaces = tt_interfaces();
 
-			// Find all interfaces using trusttunnel protocol
-			uci.foreach('network', 'interface', function(s) {
-				if (s.proto != 'trusttunnel')
-					return;
-
-				const iface = s['.name'];
-				const run_dir = '/var/run/trusttunnel';
-				const pid_file = `${run_dir}/${iface}.pid`;
-				const log_file = `${run_dir}/${iface}.log`;
-
-				const pid = read_file(pid_file);
+			for (let i = 0; i < length(ifaces); i++) {
+				const iface = ifaces[i];
+				const pid = read_file(`${RUN_DIR}/${iface}.pid`);
 				const running = is_running(pid);
-				const log = read_file(log_file);
+				const log = read_file(`${RUN_DIR}/${iface}.log`);
 				const state = running ? parse_log_status(log) : 'stopped';
 
-				// Get interface IP from system
-				const ip_out = trim_str(popen(`ip -4 addr show dev ${iface} 2>/dev/null`)?.read?.('all') ?? '');
-				const ip_m = match(ip_out, /inet ([0-9.]+\/[0-9]+)/);
-				const tun_ip = ip_m ? ip_m[1] : '';
+				const config_file = tt_config_file(iface);
+				const conf = parse_config(config_file);
 
-				const ip6_out = trim_str(popen(`ip -6 addr show dev ${iface} scope global 2>/dev/null`)?.read?.('all') ?? '');
+				// Addresses from the config are shown even while the tunnel is
+				// down, unlike the log-derived endpoint.
+				const sys = `/sys/class/net/${iface}`;
+
+				const ip_out = sh(`ip -4 addr show dev ${iface} 2>/dev/null`);
+				const ip_m = match(ip_out, /inet ([0-9.]+\/[0-9]+)/);
+
+				const ip6_out = sh(`ip -6 addr show dev ${iface} scope global 2>/dev/null`);
 				const ip6_m = match(ip6_out, /inet6 ([0-9a-f:]+\/[0-9]+)/);
-				const tun_ip6 = ip6_m ? ip6_m[1] : '';
 
 				result[iface] = {
 					name:         iface,
 					pid:          running ? pid : '',
 					running:      running,
 					state:        state,
-					tun_ip:       tun_ip,
-					tun_ip6:      tun_ip6,
-					endpoint:     parse_endpoint(log),
+					uptime:       running ? proc_uptime(pid) : 0,
+
+					tun_ip:       ip_m  ? ip_m[1]  : '',
+					tun_ip6:      ip6_m ? ip6_m[1] : '',
+					mtu:          read_num(`${sys}/mtu`),
+					oper_state:   read_file(`${sys}/operstate`),
+
+					rx_bytes:     read_num(`${sys}/statistics/rx_bytes`),
+					tx_bytes:     read_num(`${sys}/statistics/tx_bytes`),
+					rx_packets:   read_num(`${sys}/statistics/rx_packets`),
+					tx_packets:   read_num(`${sys}/statistics/tx_packets`),
+					rx_errors:    read_num(`${sys}/statistics/rx_errors`),
+					tx_errors:    read_num(`${sys}/statistics/tx_errors`),
+
+					endpoint:     parse_endpoint(log) || conf.hostname,
 					endpoint_ip:  parse_endpoint_ip(log),
+					addresses:    conf.addresses,
+					hostname:     conf.hostname,
+
+					// Config facts worth surfacing — each has bitten someone
+					skip_verify:  conf.skip_verify,
+					has_cert:     conf.has_cert,
+					killswitch:   conf.killswitch,
+					vpn_mode:     conf.vpn_mode,
+					upstream:     conf.upstream,
+
+					// Show the last error whenever the tunnel is not healthy —
+					// a running-but-failing client is the common case.
 					last_error:   (state == 'connected') ? '' : parse_last_error(log),
-					config_file:  s.config_file ?? '',
+					config_file:  config_file,
 				};
-			});
+			}
 
 			return result;
+		}
+	},
+
+	// Endpoint certificate expiry — the failure mode that is invisible until
+	// the tunnel dies. On demand only: it opens a TLS connection.
+	getCertInfo: {
+		args: { iface: 'iface' },
+		call: function(req) {
+			const iface = req.args?.iface ?? '';
+			if (!is_valid_iface(iface))
+				return { error: 'unknown interface' };
+
+			if (!has_cmd('openssl'))
+				return { error: 'openssl-util is not installed' };
+
+			const conf = parse_config(tt_config_file(iface));
+			const first_addr = length(conf.addresses) ? conf.addresses[0] : '';
+			const hp = split_host_port(first_addr, conf.hostname);
+			const host = safe_host(hp.host);
+			const sni = safe_host(conf.hostname) || host;
+			const port = match(hp.port, /^[0-9]+$/) ? hp.port : '443';
+
+			if (!host)
+				return { error: 'no usable endpoint address in config' };
+
+			const out = sh(`echo | timeout 10 openssl s_client ` +
+				`-connect ${host}:${port} -servername ${sni} 2>/dev/null ` +
+				`| openssl x509 -noout -subject -issuer -enddate 2>/dev/null`);
+
+			if (!out)
+				return { error: `no TLS response from ${host}:${port}` };
+
+			const not_after = match(out, /notAfter=(.+)/);
+			const subject   = match(out, /subject=(.+)/);
+			const issuer    = match(out, /issuer=(.+)/);
+
+			return {
+				host:      `${host}:${port}`,
+				sni:       sni,
+				// Raw OpenSSL date string; the day count is computed in the
+				// browser, which has real date parsing.
+				not_after: not_after ? trim_str(not_after[1]) : '',
+				subject:   subject   ? trim_str(subject[1])   : '',
+				issuer:    issuer    ? trim_str(issuer[1])    : '',
+			};
+		}
+	},
+
+	// Latency to the endpoint and through the tunnel. On demand: takes seconds.
+	getLatency: {
+		args: { iface: 'iface' },
+		call: function(req) {
+			const iface = req.args?.iface ?? '';
+			if (!is_valid_iface(iface))
+				return { error: 'unknown interface' };
+
+			const conf = parse_config(tt_config_file(iface));
+			const first_addr = length(conf.addresses) ? conf.addresses[0] : '';
+			const hp = split_host_port(first_addr, conf.hostname);
+			const host = safe_host(hp.host);
+
+			const res = {};
+
+			// Kept short: both pings run inside a single ubus call, so the
+			// worst case must stay well under the request timeout.
+			if (host)
+				res.endpoint = parse_ping(sh(`ping -c 2 -W 1 -q ${host} 2>&1`));
+
+			// Through the tunnel — only meaningful while the device exists.
+			// -I binds to the device, so this works even with included_routes
+			// = [], the same way `curl --interface tun0` does.
+			if (readfile(`/sys/class/net/${iface}/mtu`) != null)
+				res.tunnel = parse_ping(
+					sh(`ping -c 2 -W 1 -q -I ${iface} 1.1.1.1 2>&1`));
+
+			return res;
+		}
+	},
+
+	setInterfaceState: {
+		args: { iface: 'iface', action: 'action' },
+		call: function(req) {
+			const iface = req.args?.iface ?? '';
+			const action = req.args?.action ?? '';
+
+			// Never interpolate a name that is not a configured tt interface
+			if (!is_valid_iface(iface))
+				return { success: false, error: 'unknown interface' };
+
+			if (action == 'up')
+				sh(`ifup ${iface} 2>&1`);
+			else if (action == 'down')
+				sh(`ifdown ${iface} 2>&1`);
+			else if (action == 'restart')
+				sh(`ifdown ${iface} 2>&1; sleep 1; ifup ${iface} 2>&1`);
+			else
+				return { success: false, error: 'invalid action' };
+
+			return { success: true };
+		}
+	},
+
+	getClientLog: {
+		args: { iface: 'iface', lines: 0 },
+		call: function(req) {
+			const iface = req.args?.iface ?? '';
+			if (!is_valid_iface(iface))
+				return { error: 'unknown interface' };
+
+			const n = int(req.args?.lines ?? 50);
+			const count = (n > 0 && n <= 500) ? n : 50;
+
+			return {
+				log: sh(`tail -n ${count} ${RUN_DIR}/${iface}.log 2>/dev/null`),
+				version: sh(`${CLIENT_BIN} --version 2>/dev/null | head -1`),
+			};
 		}
 	}
 };
