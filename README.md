@@ -1,5 +1,7 @@
 # TrustTunnel для OpenWRT
 
+![Страница статуса TrustTunnel в LuCI](preview.png)
+
 Интеграция [TrustTunnel](https://github.com/TrustTunnel/TrustTunnelClient) (VPN-протокол от AdGuard) с ванильным OpenWRT через netifd — по образцу того, как устроен AmneziaWG.
 
 После установки `tun0` появляется как полноценный сетевой интерфейс в системе, а [podkop](https://podkop.net) может маршрутизировать через него выбранные домены — так же, как через `awg0`.
