@@ -67,7 +67,9 @@ function parse_endpoint(log) {
 
 function parse_endpoint_ip(log) {
 	if (!log) return '';
-	const m = match(log, /address=([0-9.:a-fA-F\[\]]+)/);
+	// The address may be a hostname:port, not just IP:port — match anything
+	// up to the next separator rather than hex/dot/colon only.
+	const m = match(log, /address=([^,\s]+)/);
 	return m ? trim_str(m[1]) : '';
 }
 

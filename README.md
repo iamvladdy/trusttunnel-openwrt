@@ -41,6 +41,47 @@ sudo ./setup_wizard
 - **Username / Password** — логин и пароль клиента
 - **Certificate** — Let's Encrypt если есть домен, иначе self-signed
 
+> **Сертификат от мастера не продлевается автоматически.** Let's Encrypt
+> выдаёт его на 90 дней, и ровно через 90 дней тоннель перестанет
+> подниматься с ошибкой `OPENSSL_internal` (см.
+> [Диагностику](#ошибка-openssl_internalunknown-library)).
+> Чтобы не попасть на это, выпустите сертификат через certbot **сразу** и
+> выберите в мастере «Provide path to existing certificate»:
+>
+> ```bash
+> sudo apt install -y certbot
+> sudo certbot certonly --standalone -d <ВАШ_ДОМЕН>   # нужен свободный :80
+> ```
+>
+> И обязательно повесить hook, который перезапустит сервер после продления —
+> без него certbot обновит файлы, а TrustTunnel продолжит отдавать старый
+> сертификат. Синтаксис зависит от версии (`certbot --version`):
+>
+> ```bash
+> # certbot >= 2.3.0
+> sudo certbot reconfigure --deploy-hook "systemctl restart trusttunnel"
+>
+> # certbot < 2.3.0 (например 0.40 из Ubuntu 20.04) — руками в конфиг продления
+> sudo sed -i '/^\[renewalparams\]/a renew_hook = systemctl restart trusttunnel' \
+>   /etc/letsencrypt/renewal/<ВАШ_ДОМЕН>.conf
+> ```
+>
+> Проверить, что весь путь продления работает без участия человека:
+>
+> ```bash
+> systemctl list-timers | grep -i certbot
+> sudo certbot renew --dry-run
+> ```
+>
+> Полная инструкция —
+> [CERT\_RENEWAL.md](https://github.com/TrustTunnel/TrustTunnel/blob/master/CERT_RENEWAL.md).
+> Проверить срок действия в любой момент:
+>
+> ```bash
+> echo | openssl s_client -connect <ДОМЕН>:443 -servername <ДОМЕН> 2>/dev/null \
+>   | openssl x509 -noout -dates
+> ```
+
 ### 1.3. Включить автозапуск
 
 ```bash
@@ -406,7 +447,7 @@ service network restart
 
 ## Диагностика
 
-### `Error: 7 ... invalid library (0):OPENSSL_internal:unknown library`
+### Ошибка `OPENSSL_internal:unknown library`
 
 ```
 TRUSTTUNNEL_CLIENT_APP operator(): Error: 7
@@ -415,7 +456,47 @@ error:00000001:invalid library (0):OPENSSL_internal:unknown library
 
 Несмотря на формулировку, это **не** проблема с библиотекой. Клиент собран
 статически с BoringSSL, и такое сообщение с пустой очередью ошибок означает,
-что **не удалось проверить сертификат сервера**. Три причины, по частоте:
+что **не удалось проверить сертификат сервера**. Конкретную причину BoringSSL
+не сообщает — её нужно искать самостоятельно, начиная с самой частой.
+
+**0. Сертификат сервера просто истёк.** Проверять это нужно первым делом —
+одна команда с любой машины:
+
+```bash
+echo | openssl s_client -connect <ДОМЕН>:443 -servername <ДОМЕН> 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+```
+
+Если `notAfter` в прошлом — причина найдена. Сертификат Let's Encrypt живёт
+90 дней, а `setup_wizard` на сервере выпускает его **без автопродления**
+(см. [1.2](#12-запустить-мастер-настройки)). Через 90 дней после установки
+тоннель умирает именно с этой ошибкой. Лечение — перевыпуск через certbot и
+deploy-hook, см.
+[CERT\_RENEWAL.md](https://github.com/TrustTunnel/TrustTunnel/blob/master/CERT_RENEWAL.md):
+
+```bash
+# на VPS
+sudo apt install -y certbot
+sudo certbot certonly --standalone -d <ДОМЕН>     # нужен свободный :80
+# прописать пути в /opt/trusttunnel/hosts.toml:
+#   cert_chain_path  = "/etc/letsencrypt/live/<ДОМЕН>/fullchain.pem"
+#   private_key_path = "/etc/letsencrypt/live/<ДОМЕН>/privkey.pem"
+sudo systemctl restart trusttunnel
+
+# hook на перезапуск после продления — синтаксис по версии certbot:
+sudo certbot reconfigure --deploy-hook "systemctl restart trusttunnel"  # >= 2.3.0
+sudo sed -i '/^\[renewalparams\]/a renew_hook = systemctl restart trusttunnel' \
+  /etc/letsencrypt/renewal/<ДОМЕН>.conf                                # < 2.3.0
+
+sudo certbot renew --dry-run
+```
+
+> Продление идёт по таймеру и молча, поэтому VPS должен **надёжно** резолвить
+> DNS — иначе `certbot renew` падает на обращении к ACME API, и вы узнаете об
+> этом только когда тоннель отвалится. Если резолвер прописан по DHCP и
+> подглючивает, задайте свой явно в `/etc/systemd/resolved.conf`
+> (`DNS=1.1.1.1 8.8.8.8`) и проверьте:
+> `getent hosts acme-v02.api.letsencrypt.org`.
 
 **1. На роутере нет системного хранилища корневых сертификатов.**
 Если в конфиге `certificate = ""`, клиент использует системное хранилище —

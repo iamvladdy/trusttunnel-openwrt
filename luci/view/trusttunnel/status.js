@@ -29,7 +29,7 @@ function errorHint(err) {
 		return null;
 
 	if (/OPENSSL_internal|invalid library|certificate verify failed|Handshake failed/.test(err))
-		return _('TLS to the endpoint failed. Check that the ca-bundle package is installed, that [endpoint] hostname matches the server certificate, and that the router clock is correct. For a self-signed server certificate, pin it via [endpoint] certificate in the client config.');
+		return _('The server certificate could not be verified. Check its expiry first — a wizard-issued Let\'s Encrypt certificate is not renewed automatically and dies after 90 days: openssl s_client -connect HOST:443 -servername HOST | openssl x509 -noout -dates. Then check that ca-bundle is installed, that [endpoint] hostname matches the certificate, and that the router clock is correct.');
 
 	if (/Authorization failed|401|Unauthorized/.test(err))
 		return _('The endpoint rejected the credentials. Check username and password in the client config.');
