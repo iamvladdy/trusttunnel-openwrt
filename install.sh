@@ -48,6 +48,30 @@ if [ ! -s /etc/ssl/cert.pem ] && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; th
 fi
 echo ""
 
+# ---- Stop running interfaces before replacing scripts and binary ----
+#
+# The upstream client installer unlinks the running binary, so a live client
+# keeps executing the old code until the interface is restarted. Dependencies
+# are installed first on purpose: if that step aborts, the tunnel is still up.
+
+TT_RESUME=""
+
+for iface in $(uci show network 2>/dev/null \
+        | awk -F'[.=]' '/\.proto=.trusttunnel/{print $2}'); do
+    # Leave interfaces the user has explicitly disabled alone
+    if [ "$(uci -q get "network.${iface}.disabled")" = "1" ]; then
+        echo "Skipping $iface (disabled in UCI)"
+        continue
+    fi
+    echo "Stopping $iface for upgrade..."
+    ifdown "$iface" 2>/dev/null || true
+    TT_RESUME="$TT_RESUME $iface"
+done
+
+if [ -n "$TT_RESUME" ]; then
+    echo ""
+fi
+
 # ---- Install files from repo ----
 
 _install() {
@@ -94,6 +118,20 @@ echo "Downloading TrustTunnel client binary..."
 curl -fsSL \
     https://raw.githubusercontent.com/TrustTunnel/TrustTunnelClient/refs/heads/master/scripts/install.sh \
     | sh -s - -o /opt/trusttunnel_client
+
+# ---- Bring back the interfaces stopped for the upgrade ----
+
+if [ -n "$TT_RESUME" ]; then
+    echo ""
+    for iface in $TT_RESUME; do
+        echo "Starting $iface..."
+        ifup "$iface" 2>/dev/null || true
+    done
+    echo ""
+    echo "netifd brings interfaces up asynchronously — the proto handler waits"
+    echo "for WAN, NTP and the TUN device, so allow ~15s before checking:"
+    echo "  logread | grep trusttunnel | tail -20"
+fi
 
 echo ""
 echo "=== Installation complete ==="
