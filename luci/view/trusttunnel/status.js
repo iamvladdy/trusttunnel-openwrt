@@ -214,7 +214,9 @@ function handleLog(iface, ev) {
 	probes[iface] = probes[iface] || {};
 	if (probes[iface].log) {
 		probes[iface].log = null;
-		return Promise.resolve();
+		// Redraw at once — without this the panel stays visible until the
+		// next poll tick, which reads as a dead button.
+		return refreshNow();
 	}
 	return withBusy(iface, function() {
 		return callClientLog(iface, 50).then(function(res) {
@@ -286,7 +288,10 @@ function latencyTiles(lat) {
 	function one(label, p, note) {
 		if (!p) return;
 		if (!p.ok) {
-			out.push(tile(label, E('span', { 'class': 'tt-dim' }, [ _('no reply') ]), note));
+			out.push(tile(label,
+				E('span', { 'class': 'tt-dim', 'style': 'font-size:.95rem' },
+					[ _('failed') ]),
+				p.reason || note));
 			return;
 		}
 		out.push(tile(label, p.avg + ' ms',
@@ -294,7 +299,7 @@ function latencyTiles(lat) {
 	}
 
 	one(_('Endpoint RTT'), lat.endpoint, _('direct to server'));
-	one(_('Tunnel RTT'), lat.tunnel, _('via 1.1.1.1 through tun'));
+	one(_('Tunnel RTT'), lat.tunnel, _('ICMP to 1.1.1.1 bound to the tun device'));
 
 	return out;
 }
@@ -324,7 +329,10 @@ function renderIface(name, info) {
 			txRate !== null ? fmtRate(txRate) : _('%s packets').format(fmtNum(info.tx_packets))),
 		tile(_('Uptime'), info.running ? fmtDuration(info.uptime) : '—',
 			info.pid ? _('PID %s').format(info.pid) : null),
-		tile(_('MTU'), info.mtu ? String(info.mtu) : '—', info.oper_state || null)
+		/* TUN devices report operstate "unknown", which is noise — only show
+		   the value when it actually says something. */
+		tile(_('MTU'), info.mtu ? String(info.mtu) : '—',
+			(info.oper_state && info.oper_state != 'unknown') ? info.oper_state : null)
 	];
 
 	if (info.rx_errors || info.tx_errors)
@@ -340,6 +348,7 @@ function renderIface(name, info) {
 		[ _('TUN IPv4'),   info.tun_ip  ? mono(info.tun_ip)  : dash() ],
 		[ _('TUN IPv6'),   info.tun_ip6 ? mono(info.tun_ip6) : dash() ],
 		[ _('TLS hostname'), info.hostname ? mono(info.hostname) : dash() ],
+		info.custom_sni ? [ _('Custom SNI'), mono(info.custom_sni) ] : null,
 		[ _('Endpoint addresses'), addrList ],
 		info.endpoint_ip ? [ _('Connected to'), mono(info.endpoint_ip) ] : null,
 		[ _('Mode'), E('span', {}, [
@@ -364,6 +373,15 @@ function renderIface(name, info) {
 	var certNote = certPanel(p.cert);
 	if (certNote)
 		notes.push(certNote);
+
+	/* A failed tunnel ping is expected in the podkop setup: with
+	   included_routes = [] there is no route for arbitrary destinations via
+	   the tun device, so binding to it cannot deliver the packet. Say so
+	   instead of leaving a bare failure on screen. */
+	if (p.latency && p.latency.tunnel && !p.latency.tunnel.ok)
+		notes.push(E('div', { 'class': 'tt-note tt-n-info' }, [
+			_('Tunnel RTT failing is normal with included_routes = [] — routing is podkop\'s job, so there is no route to 1.1.1.1 through the tun device and ICMP bound to it cannot be delivered. It does not mean the tunnel is broken: verify with a destination podkop actually routes, e.g. curl --interface %s https://ifconfig.me').format(name)
+		]));
 
 	if (info.last_error) {
 		notes.push(E('div', { 'class': 'tt-note tt-n-err' }, [

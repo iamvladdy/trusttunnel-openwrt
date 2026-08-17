@@ -96,16 +96,54 @@ function unquote(s) {
 	return trim_str(replace(s ?? '', /^["']|["']$/g, ''));
 }
 
+// Collect every quoted string out of one match result, tolerating both shapes
+// a g-flag match can return (array of groups, or bare strings).
+function collect_quoted(line, out) {
+	const items = match(line, /"([^"]+)"/g);
+	for (let i = 0; i < length(items ?? []); i++) {
+		const it = items[i];
+		const v = (type(it) == 'array') ? it[1] : it;
+		if (v)
+			push(out, replace(v, /"/g, ''));
+	}
+}
+
+// addresses may be written inline or spread over several lines:
+//   addresses = ["1.2.3.4:443"]
+//   addresses = [
+//     "1.2.3.4:443",
+//   ]
+// so keep reading until the closing bracket instead of looking at one line.
+function parse_addresses(text) {
+	const lines = split(text ?? '', '\n');
+	const out = [];
+	let collecting = false;
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = trim_str(lines[i]);
+
+		if (!collecting) {
+			if (substr(line, 0, 9) != 'addresses')
+				continue;
+			const rest = trim_str(substr(line, 9));
+			if (substr(rest, 0, 1) != '=')
+				continue;
+			line = trim_str(substr(rest, 1));
+			collecting = true;
+		}
+
+		collect_quoted(line, out);
+
+		if (index(line, ']') >= 0)
+			break;
+	}
+
+	return out;
+}
+
 function parse_config(path) {
 	const text = readfile(path) ?? '';
-
-	const addrs = [];
-	const raw = conf_value(text, 'addresses');
-	if (raw) {
-		const items = match(raw, /"([^"]+)"/g);
-		for (let i = 0; i < length(items ?? []); i++)
-			push(addrs, items[i][1]);
-	}
+	const addrs = parse_addresses(text);
 
 	// A pinned certificate is usually a TOML multi-line string, so the value on
 	// the key line is just `"""` — test for "not empty" the same way the proto
@@ -116,6 +154,9 @@ function parse_config(path) {
 
 	return {
 		hostname:      unquote(conf_value(text, 'hostname')),
+		// When set, this replaces hostname as the TLS SNI, so the certificate
+		// check must use it too or it would query the wrong virtual host.
+		custom_sni:    unquote(conf_value(text, 'custom_sni')),
 		addresses:     addrs,
 		mtu_size:      unquote(conf_value(text, 'mtu_size')),
 		skip_verify:   unquote(conf_value(text, 'skip_verification')) == 'true',
@@ -166,19 +207,27 @@ function parse_log_status(log) {
 	return state;
 }
 
+// Take the first line of a captured value. Used instead of putting '\n' in a
+// negated character class: an escape inside a bracket expression is not
+// portable, and '[^,\n]' can degrade into "not comma, not backslash, not n",
+// which truncates any hostname containing the letter n.
+function first_line(s) {
+	return trim_str(split(s ?? '', '\n')[0] ?? '');
+}
+
 function parse_endpoint(log) {
 	if (!log) return '';
 	// Line example: Using endpoint: name=tt.example.com, address=1.2.3.4:443, ...
-	const m = match(log, /Using endpoint: name=([^,\n]+)/);
-	return m ? trim_str(m[1]) : '';
+	const m = match(log, /Using endpoint: name=([^,]+)/);
+	return m ? first_line(m[1]) : '';
 }
 
 function parse_endpoint_ip(log) {
 	if (!log) return '';
-	// The address may be a hostname:port, not just IP:port — match anything
-	// up to the next separator rather than hex/dot/colon only.
-	const m = match(log, /address=([^,\s]+)/);
-	return m ? trim_str(m[1]) : '';
+	// The address may be a hostname:port, not just IP:port, so match up to the
+	// next separator rather than hex/dot/colon only.
+	const m = match(log, /address=([^,]+)/);
+	return m ? first_line(m[1]) : '';
 }
 
 function parse_last_error(log) {
@@ -221,8 +270,14 @@ function is_valid_iface(iface) {
 }
 
 // Only hostnames/IPs and ports may be interpolated into a shell command.
+//
+// The character class deliberately contains no escaped characters: an escape
+// inside a bracket expression is not portable across regex engines, and
+// '[A-Za-z0-9._:\[\]-]' silently degrades into a pattern that matches nothing
+// useful. Bracketed IPv6 literals never reach here — split_host_port() strips
+// the brackets first.
 function safe_host(s) {
-	return match(s ?? '', /^[A-Za-z0-9._:\[\]-]+$/) ? s : '';
+	return match(s ?? '', /^[0-9A-Za-z._:-]+$/) ? s : '';
 }
 
 function split_host_port(addr, fallback_host) {
@@ -250,6 +305,47 @@ function split_host_port(addr, fallback_host) {
 	return { host: host, port: port };
 }
 
+// Work out what to probe for an interface, trying every source rather than
+// trusting the config parse alone: a config the reader cannot handle would
+// otherwise disable the certificate and latency checks entirely. The client
+// log is authoritative — it records the endpoint the client actually used.
+function endpoint_target(iface) {
+	const conf = parse_config(tt_config_file(iface));
+	const log = read_file(`${RUN_DIR}/${iface}.log`);
+	const log_name = parse_endpoint(log);
+	const log_addr = parse_endpoint_ip(log);
+
+	const cands = [];
+	if (length(conf.addresses))
+		push(cands, conf.addresses[0]);
+	if (conf.hostname)
+		push(cands, conf.hostname);
+	if (log_addr)
+		push(cands, log_addr);
+	if (log_name)
+		push(cands, log_name);
+
+	// SNI must be a name, never an IP literal. custom_sni wins when present,
+	// because that is what the client itself sends.
+	const sni = safe_host(conf.custom_sni) || safe_host(conf.hostname) ||
+		safe_host(log_name) || '';
+
+	for (let i = 0; i < length(cands); i++) {
+		const hp = split_host_port(cands[i], '');
+		const host = safe_host(hp.host);
+		if (!host)
+			continue;
+		return {
+			host: host,
+			port: match(hp.port, /^[0-9]+$/) ? hp.port : '443',
+			sni:  sni || host,
+			from: (i == 0 && length(conf.addresses)) ? 'config' : 'log',
+		};
+	}
+
+	return null;
+}
+
 function parse_ping(out) {
 	if (!out)
 		return null;
@@ -259,12 +355,37 @@ function parse_ping(out) {
 	const r = match(out, /= *([0-9.]+)\/([0-9.]+)\/([0-9.]+)/);
 	const loss = match(out, /([0-9]+)% packet loss/);
 
+	// On failure report what ping actually said. "Network is unreachable" and
+	// "100% packet loss" mean very different things, and collapsing both into
+	// "no reply" throws away the only useful part of the result.
+	let reason = '';
+	if (!r) {
+		// Plain substring search over lines rather than a regex — keeps the
+		// pattern free of bracket-class escapes entirely.
+		const needles = [ 'nreachable', 'not permitted', 'bad address',
+		                  'unknown host', 'Operation not' ];
+		const lines = split(out, '\n');
+
+		for (let i = 0; i < length(lines) && !reason; i++)
+			for (let j = 0; j < length(needles); j++)
+				if (index(lines[i], needles[j]) >= 0) {
+					reason = trim_str(lines[i]);
+					break;
+				}
+
+		if (!reason && loss)
+			reason = `${loss[1]}% packet loss`;
+		if (!reason)
+			reason = first_line(out);
+	}
+
 	return {
-		min:  r ? r[1] : '',
-		avg:  r ? r[2] : '',
-		max:  r ? r[3] : '',
-		loss: loss ? int(loss[1]) : 100,
-		ok:   (r != null),
+		min:    r ? r[1] : '',
+		max:    r ? r[3] : '',
+		avg:    r ? r[2] : '',
+		loss:   loss ? int(loss[1]) : 100,
+		ok:     (r != null),
+		reason: reason,
 	};
 }
 
@@ -317,6 +438,7 @@ const methods = {
 					endpoint_ip:  parse_endpoint_ip(log),
 					addresses:    conf.addresses,
 					hostname:     conf.hostname,
+					custom_sni:   conf.custom_sni,
 
 					// Config facts worth surfacing — each has bitten someone
 					skip_verify:  conf.skip_verify,
@@ -348,15 +470,12 @@ const methods = {
 			if (!has_cmd('openssl'))
 				return { error: 'openssl-util is not installed' };
 
-			const conf = parse_config(tt_config_file(iface));
-			const first_addr = length(conf.addresses) ? conf.addresses[0] : '';
-			const hp = split_host_port(first_addr, conf.hostname);
-			const host = safe_host(hp.host);
-			const sni = safe_host(conf.hostname) || host;
-			const port = match(hp.port, /^[0-9]+$/) ? hp.port : '443';
+			const tgt = endpoint_target(iface);
+			if (!tgt)
+				return { error: 'no usable endpoint address found in the ' +
+					'client config or log — check [endpoint] hostname/addresses' };
 
-			if (!host)
-				return { error: 'no usable endpoint address in config' };
+			const host = tgt.host, port = tgt.port, sni = tgt.sni;
 
 			const out = sh(`echo | timeout 10 openssl s_client ` +
 				`-connect ${host}:${port} -servername ${sni} 2>/dev/null ` +
@@ -389,21 +508,17 @@ const methods = {
 			if (!is_valid_iface(iface))
 				return { error: 'unknown interface' };
 
-			const conf = parse_config(tt_config_file(iface));
-			const first_addr = length(conf.addresses) ? conf.addresses[0] : '';
-			const hp = split_host_port(first_addr, conf.hostname);
-			const host = safe_host(hp.host);
-
+			const tgt = endpoint_target(iface);
 			const res = {};
 
 			// Kept short: both pings run inside a single ubus call, so the
 			// worst case must stay well under the request timeout.
-			if (host)
-				res.endpoint = parse_ping(sh(`ping -c 2 -W 1 -q ${host} 2>&1`));
+			if (tgt)
+				res.endpoint = parse_ping(sh(`ping -c 2 -W 1 -q ${tgt.host} 2>&1`));
 
 			// Through the tunnel — only meaningful while the device exists.
-			// -I binds to the device, so this works even with included_routes
-			// = [], the same way `curl --interface tun0` does.
+			// Note this needs a route via the device, which included_routes = []
+			// deliberately does not create; a failure here is not conclusive.
 			if (readfile(`/sys/class/net/${iface}/mtu`) != null)
 				res.tunnel = parse_ping(
 					sh(`ping -c 2 -W 1 -q -I ${iface} 1.1.1.1 2>&1`));
